@@ -1,0 +1,832 @@
+diff --git a/libs/storage/Tsavorite/cs/src/core/Device/Agent.cs b/libs/storage/Tsavorite/cs/src/core/Device/Agent.cs
+new file mode 100644
+index 000000000..93240d3be
+--- /dev/null
++++ b/libs/storage/Tsavorite/cs/src/core/Device/Agent.cs
+@@ -0,0 +1,83 @@
++using System;
++using System.Buffers;
++using System.Runtime.InteropServices;
++using System.Reflection;
++
++namespace Tsavorite.core
++{
++    /// <summary>
++    /// Provides PD3 Check and Return functionality.
++    /// </summary>
++    public static class Agent
++    {
++        private static MemoryPool<byte> memoryPool => MemoryPool<byte>.Shared;
++
++        #region Agent Library
++        const string NativeLibraryName = "agent";
++        static readonly string NativeLibraryPath = null;
++
++        static Agent()
++        {
++          if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
++                NativeLibraryPath = "runtimes/win-x64/native/agent.dll";
++            else
++                NativeLibraryPath = "/data/ssankhe/PD3/build/lib/libagent.so";
++            NativeLibrary.SetDllImportResolver(typeof(Agent).Assembly, ImportResolver);
++        }
++
++        static IntPtr ImportResolver(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
++        {
++            IntPtr libHandle = IntPtr.Zero;
++            if (libraryName == NativeLibraryName && NativeLibraryPath != null)
++                libHandle = NativeLibrary.Load(NativeLibraryPath);
++            return libHandle;
++        }
++
++        [DllImport(NativeLibraryName, EntryPoint = "Agent_Init", CallingConvention = CallingConvention.Cdecl)]
++        static extern void Agent_Init(string agentId, string agentKey);
++
++        [DllImport(NativeLibraryName, EntryPoint = "Agent_CheckAndReturn", CallingConvention = CallingConvention.Cdecl)]
++        static extern bool Agent_CheckAndReturn(IntPtr key, int keyLength);
++
++        #endregion
++
++        /// <summary>
++        /// Initializes the agent.
++        /// </summary>
++        /// <param name="agentId">The agent ID.</param>
++        /// <param name="agentKey">The agent key.</param>
++        public static void Initialize(string agentId, string agentKey)
++        {
++            Agent_Init(agentId, agentKey);
++        }
++
++        /// <summary>
++        /// Checks and returns data using PD3 Check and Return.
++        /// </summary>
++        /// <param name="key">The key to check.</param>
++        /// <param name="output">The output buffer.</param>
++        /// <returns>True if the operation was successful, false otherwise.</returns>
++        public static unsafe bool CheckAndReturn(ref SpanByte key, ref SpanByteAndMemory output)
++        {
++            Span<byte> bytes = [
++                0x24, 0x38, 0x0D, 0x0A, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x0D, 0x0A
++            ];
++            if (output.IsSpanByte)
++            {
++                if (output.Length < 14)
++                {
++                    output.Length = 14;
++                    return Agent_CheckAndReturn(new IntPtr(key.ToPointer()), key.Length);
++                }
++                output.CopyFrom(bytes, memoryPool);
++            }
++
++            output.Length = 14;
++            output.Memory = memoryPool.Rent(output.Length);
++            fixed (byte* outputPtr = output.Memory.Memory.Span)
++            {
++                return Agent_CheckAndReturn(new IntPtr(key.ToPointer()), key.Length);
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/libs/storage/Tsavorite/cs/src/core/Device/Devices.cs b/libs/storage/Tsavorite/cs/src/core/Device/Devices.cs
+index 4dfc6e4e9..c4e1715a1 100644
+--- a/libs/storage/Tsavorite/cs/src/core/Device/Devices.cs
++++ b/libs/storage/Tsavorite/cs/src/core/Device/Devices.cs
+@@ -30,12 +30,14 @@ namespace Tsavorite.core
+         /// <param name="readOnly">Open file in readOnly mode</param>
+         /// <param name="logger"></param>
+         /// <returns>Device instance</returns>
+-        public static IDevice CreateLogDevice(string logPath, bool preallocateFile = false, bool deleteOnClose = false, long capacity = CAPACITY_UNSPECIFIED, bool recoverDevice = false, bool useIoCompletionPort = false, bool disableFileBuffering = true, bool useNativeDeviceLinux = false, bool readOnly = false, ILogger logger = null)
++        public static IDevice CreateLogDevice(string logPath, bool preallocateFile = false, bool deleteOnClose = false, long capacity = CAPACITY_UNSPECIFIED, bool recoverDevice = false, bool useIoCompletionPort = false, bool disableFileBuffering = true, bool useNativeDeviceLinux = true, bool readOnly = false, ILogger logger = null)
+         {
+             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+             {
+                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && useNativeDeviceLinux)
+-                    return new NativeStorageDevice(logPath, deleteOnClose, disableFileBuffering, capacity, logger: logger);
++                    // return new NativeStorageDevice(logPath, deleteOnClose, disableFileBuffering, capacity, logger: logger);
++                    // return new RdmaSyncDevice(logPath, deleteOnClose, disableFileBuffering, capacity, logger: logger);
++                    return new RedyDevice(logPath, deleteOnClose, disableFileBuffering, capacity, logger: logger);
+                 else
+                     return new ManagedLocalStorageDevice(logPath, preallocateFile, deleteOnClose, disableFileBuffering, capacity, recoverDevice, readOnly: readOnly);
+             }
+diff --git a/libs/storage/Tsavorite/cs/src/core/Device/RdmaSyncDevice.cs b/libs/storage/Tsavorite/cs/src/core/Device/RdmaSyncDevice.cs
+new file mode 100644
+index 000000000..24f411b2f
+--- /dev/null
++++ b/libs/storage/Tsavorite/cs/src/core/Device/RdmaSyncDevice.cs
+@@ -0,0 +1,334 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++using System;
++using System.Collections.Concurrent;
++using System.IO;
++using System.Reflection;
++using System.Runtime.InteropServices;
++using System.Threading;
++using Microsoft.Extensions.Logging;
++
++namespace Tsavorite.core
++{
++    struct RdmaSyncResult
++    {
++        public DeviceIOCompletionCallback callback;
++        public object context;
++    }
++
++    /// <summary>
++    /// Native version of local storage device
++    /// </summary>
++    public unsafe class RdmaSyncDevice : StorageDeviceBase
++    {
++        const int MaxResults = 1 << 12;
++        const uint sectorSize = 512;
++
++        readonly ConcurrentQueue<int> freeResults = new();
++        readonly ILogger logger;
++        RdmaSyncResult[] results;
++
++        /// <summary>
++        /// Number of pending reads on device
++        /// </summary>
++        int numPending = 0;
++
++        readonly int nativeSegmentSizeBits;
++        int resultOffset;
++
++        #region RdmaSync storage interface
++
++        const string NativeLibraryName = "rdma_device";
++        static readonly string NativeLibraryPath = null;
++
++        static RdmaSyncDevice()
++        {
++            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
++                NativeLibraryPath = "runtimes/win-x64/native/native_device.dll";
++            else
++                NativeLibraryPath = "/data/ssankhe/PD3/build/lib/librdma_sync_device.so";
++            NativeLibrary.SetDllImportResolver(typeof(RdmaSyncDevice).Assembly, ImportResolver);
++        }
++
++        static IntPtr ImportResolver(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
++        {
++            IntPtr libHandle = IntPtr.Zero;
++            if (libraryName == NativeLibraryName && NativeLibraryPath != null)
++                libHandle = NativeLibrary.Load(NativeLibraryPath);
++            return libHandle;
++        }
++
++        /// <summary>
++        /// Async callback delegate
++        /// </summary>
++        public delegate void AsyncIOCallback(IntPtr context, int result, ulong bytesTransferred);
++        readonly IntPtr nativeDevice;
++
++        [DllImport(NativeLibraryName, EntryPoint = "RdmaDevice_Create", CallingConvention = CallingConvention.Cdecl)]
++        static extern IntPtr RdmaDevice_Create(string file, bool enablePrivileges, bool unbuffered, bool delete_on_close);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RdmaDevice_Destroy", CallingConvention = CallingConvention.Cdecl)]
++        static extern void RdmaDevice_Destroy(IntPtr device);
++
++        // [DllImport(NativeLibraryName, EntryPoint = "NativeDevice_sector_size", CallingConvention = CallingConvention.Cdecl)]
++        // static extern uint NativeDevice_sector_size(IntPtr device);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RdmaDevice_ReadAsync", CallingConvention = CallingConvention.Cdecl)]
++        static extern int RdmaDevice_ReadAsync(IntPtr device, ulong source, IntPtr dest, uint length, AsyncIOCallback callback, IntPtr context);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RdmaDevice_WriteAsync", CallingConvention = CallingConvention.Cdecl)]
++        static extern int RdmaDevice_WriteAsync(IntPtr device, IntPtr source, ulong dest, uint length, AsyncIOCallback callback, IntPtr context);
++
++        // [DllImport(NativeLibraryName, EntryPoint = "NativeDevice_CreateDir", CallingConvention = CallingConvention.Cdecl)]
++        // static extern void NativeDevice_CreateDir(IntPtr device, string dir);
++
++        // [DllImport(NativeLibraryName, EntryPoint = "NativeDevice_TryComplete", CallingConvention = CallingConvention.Cdecl)]
++        // static extern bool NativeDevice_TryComplete(IntPtr device);
++
++        // [DllImport(NativeLibraryName, EntryPoint = "NativeDevice_QueueRun", CallingConvention = CallingConvention.Cdecl)]
++        // static extern int NativeDevice_QueueRun(IntPtr device, int timeout_secs);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RdmaDevice_GetFileSize", CallingConvention = CallingConvention.Cdecl)]
++        static extern ulong RdmaDevice_GetFileSize(IntPtr device, ulong segment);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RdmaDevice_Reset", CallingConvention = CallingConvention.Cdecl)]
++        static extern void RdmaDevice_Reset(IntPtr device);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RdmaDevice_RemoveSegment", CallingConvention = CallingConvention.Cdecl)]
++        static extern void RdmaDevice_RemoveSegment(IntPtr device, ulong segment);
++        #endregion
++
++        readonly AsyncIOCallback _callbackDelegate;
++        // readonly CancellationTokenSource completionThreadToken;
++        // readonly SemaphoreSlim completionThreadSemaphore;
++        // int numCompletionThreads;
++
++        void _callback(IntPtr context, int errorCode, ulong numBytes)
++        {
++            Interlocked.Decrement(ref numPending);
++            var result = results[(int)context];
++            result.callback((uint)errorCode, (uint)numBytes, result.context);
++            freeResults.Enqueue((int)context);
++        }
++
++        /// <inheritdoc />
++        public override bool Throttle() => numPending > ThrottleLimit;
++
++        /// <summary>
++        /// Constructor with more options for derived classes
++        /// </summary>
++        /// <param name="filename">File name (or prefix) with path</param>
++        /// <param name="deleteOnClose"></param>
++        /// <param name="disableFileBuffering"></param>
++        /// <param name="capacity">The maximum number of bytes this storage device can accommodate, or CAPACITY_UNSPECIFIED if there is no such limit </param>
++        /// <param name="numCompletionThreads">Number of IO completion threads</param>
++        /// <param name="logger"></param>
++        public RdmaSyncDevice(string filename,
++                                      bool deleteOnClose = false,
++                                      bool disableFileBuffering = true,
++                                      long capacity = Devices.CAPACITY_UNSPECIFIED, int numCompletionThreads = 1, ILogger logger = null)
++                : base(filename, GetSectorSize(filename), capacity)
++        {
++
++            // Native device uses a fixed segment size
++            nativeSegmentSizeBits = 25;
++
++            _callbackDelegate = _callback;
++
++            if (filename.Length > Native32.WIN32_MAX_PATH - 11)     // -11 to allow for ".<segment>"
++                throw new TsavoriteException($"Path {filename} is too long");
++
++            ThrottleLimit = 120;
++
++            string path = new FileInfo(filename).Directory.FullName;
++            if (!Directory.Exists(path))
++                Directory.CreateDirectory(path);
++            this.logger = logger;
++
++            nativeDevice = RdmaDevice_Create(filename, false, disableFileBuffering, deleteOnClose);
++            results = new RdmaSyncResult[MaxResults];
++        }
++
++        /// <inheritdoc />
++        public override void Initialize(long segmentSize, LightEpoch epoch = null, bool omitSegmentIdFromFilename = false)
++        {
++            // We can simulate any segment size less than or equal to native segment size
++            if (segmentSize > (1L << nativeSegmentSizeBits))
++                throw new TsavoriteException("Native storage device does not support segment sizes greater than 1GB");
++            base.Initialize(segmentSize, epoch, omitSegmentIdFromFilename);
++        }
++
++        /// <inheritdoc />
++        public override void Reset()
++            => RdmaDevice_Reset(nativeDevice);
++
++        /// <inheritdoc />
++        public override void ReadAsync(int segmentId, ulong sourceAddress,
++                                     IntPtr destinationAddress,
++                                     uint readLength,
++                                     DeviceIOCompletionCallback callback,
++                                     object context)
++        {
++            int offset;
++            while (!freeResults.TryDequeue(out offset))
++            {
++                if (resultOffset < MaxResults)
++                {
++                    offset = Interlocked.Increment(ref resultOffset) - 1;
++                    if (offset < MaxResults) break;
++                }
++                Thread.Yield();
++            }
++            ref var result = ref results[offset];
++            result.context = context;
++            result.callback = callback;
++
++            try
++            {
++                if (Interlocked.Increment(ref numPending) <= 0)
++                    throw new Exception("Cannot operate on disposed device");
++                int _result = RdmaDevice_ReadAsync(nativeDevice, ((ulong)segmentId << nativeSegmentSizeBits) | sourceAddress, destinationAddress, readLength, _callbackDelegate, (IntPtr)offset);
++
++                if (_result != 0)
++                {
++                    throw new IOException("Error reading from log file", _result);
++                }
++            }
++            catch (IOException e)
++            {
++                Interlocked.Decrement(ref numPending);
++                callback((uint)(e.HResult & 0x0000FFFF), 0, context);
++                freeResults.Enqueue(offset);
++            }
++            catch
++            {
++                Interlocked.Decrement(ref numPending);
++                callback(uint.MaxValue, 0, context);
++                freeResults.Enqueue(offset);
++            }
++        }
++
++        /// <inheritdoc />
++        public override unsafe void WriteAsync(IntPtr sourceAddress,
++                                      int segmentId,
++                                      ulong destinationAddress,
++                                      uint numBytesToWrite,
++                                      DeviceIOCompletionCallback callback,
++                                      object context)
++        {
++            int offset;
++            while (!freeResults.TryDequeue(out offset))
++            {
++                if (resultOffset < MaxResults)
++                {
++                    offset = Interlocked.Increment(ref resultOffset) - 1;
++                    if (offset < MaxResults) break;
++                }
++                Thread.Yield();
++            }
++            ref var result = ref results[offset];
++            result.context = context;
++            result.callback = callback;
++
++            try
++            {
++                if (Interlocked.Increment(ref numPending) <= 0)
++                    throw new Exception("Cannot operate on disposed device");
++                int _result = RdmaDevice_WriteAsync(nativeDevice, sourceAddress, ((ulong)segmentId << nativeSegmentSizeBits) | destinationAddress, numBytesToWrite, _callbackDelegate, (IntPtr)offset);
++
++                if (_result != 0)
++                {
++                    throw new IOException("Error writing to log file", _result);
++                }
++            }
++            catch (IOException e)
++            {
++                Interlocked.Decrement(ref numPending);
++                callback((uint)(e.HResult & 0x0000FFFF), 0, context);
++            }
++            catch
++            {
++                Interlocked.Decrement(ref numPending);
++                callback(uint.MaxValue, 0, context);
++            }
++        }
++
++        /// <summary>
++        /// <see cref="IDevice.RemoveSegment(int)"/>
++        /// </summary>
++        /// <param name="segment"></param>
++        public override void RemoveSegment(int segment)
++            => RdmaDevice_RemoveSegment(nativeDevice, (ulong)segment);
++
++        /// <summary>
++        /// <see cref="IDevice.RemoveSegmentAsync(int, AsyncCallback, IAsyncResult)"/>
++        /// </summary>
++        /// <param name="segment"></param>
++        /// <param name="callback"></param>
++        /// <param name="result"></param>
++        public override void RemoveSegmentAsync(int segment, AsyncCallback callback, IAsyncResult result)
++        {
++            RemoveSegment(segment);
++            callback(result);
++        }
++
++        /// <summary>
++        /// Close device
++        /// </summary>
++        public override void Dispose()
++        {
++            // Stop accepting new requests, drain all pending
++            if (nativeDevice != IntPtr.Zero)
++            {
++                // Wait for all operations to complete (just to be safe).
++                while (Interlocked.CompareExchange(ref numPending, 0, 0) != 0)
++                {
++                    Thread.Sleep(10);
++                }
++
++                RdmaDevice_Destroy(nativeDevice);
++            }
++        }
++
++        // /// <inheritdoc/>
++        // public override bool TryComplete()
++        //     => NativeDevice_TryComplete(nativeDevice);
++
++        /// <inheritdoc/>
++        public override long GetFileSize(int segment)
++            => (long)RdmaDevice_GetFileSize(nativeDevice, (ulong)segment);
++
++        /// <summary>
++        ///
++        /// </summary>
++        /// <param name="segmentId"></param>
++        /// <returns></returns>
++        protected string GetSegmentName(int segmentId) => GetSegmentFilename(FileName, segmentId);
++
++        private static uint GetSectorSize(string filename)
++        {
++            return sectorSize;
++        }
++
++        // void CompletionWorker()
++        // {
++        //     try
++        //     {
++        //         while (true)
++        //         {
++        //             if (completionThreadToken.IsCancellationRequested) break;
++        //             NativeDevice_QueueRun(nativeDevice, 5);
++        //             Thread.Yield();
++        //         }
++        //     }
++        //     finally
++        //     {
++        //         if (Interlocked.Decrement(ref numCompletionThreads) == 0)
++        //         {
++        //             completionThreadSemaphore.Release();
++        //         }
++        //     }
++        // }
++    }
++}
+\ No newline at end of file
+diff --git a/libs/storage/Tsavorite/cs/src/core/Device/RedyDevice.cs b/libs/storage/Tsavorite/cs/src/core/Device/RedyDevice.cs
+new file mode 100644
+index 000000000..3cd603887
+--- /dev/null
++++ b/libs/storage/Tsavorite/cs/src/core/Device/RedyDevice.cs
+@@ -0,0 +1,335 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT license.
++
++using System;
++using System.Collections.Concurrent;
++using System.IO;
++using System.Reflection;
++using System.Runtime.InteropServices;
++using System.Threading;
++using Microsoft.Extensions.Logging;
++
++namespace Tsavorite.core
++{
++    struct RedyResult
++    {
++        public DeviceIOCompletionCallback callback;
++        public object context;
++    }
++
++    /// <summary>
++    /// Native version of local storage device
++    /// </summary>
++    public unsafe class RedyDevice : StorageDeviceBase
++    {
++        const int MaxResults = 1 << 12;
++        const uint sectorSize = 512;
++
++        readonly ConcurrentQueue<int> freeResults = new();
++        readonly ILogger logger;
++        RedyResult[] results;
++
++        /// <summary>
++        /// Number of pending reads on device
++        /// </summary>
++        int numPending = 0;
++
++        readonly int nativeSegmentSizeBits;
++        int resultOffset;
++
++        #region Redy storage interface
++
++        const string NativeLibraryName = "redy_device";
++        static readonly string NativeLibraryPath = null;
++
++        static RedyDevice()
++        {
++            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
++                NativeLibraryPath = "runtimes/win-x64/native/redy_device.dll";
++            else
++                NativeLibraryPath = "/data/ssankhe/PD3/build/lib/libredy_device.so";
++            NativeLibrary.SetDllImportResolver(typeof(RedyDevice).Assembly, ImportResolver);
++        }
++
++        static IntPtr ImportResolver(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
++        {
++            IntPtr libHandle = IntPtr.Zero;
++            if (libraryName == NativeLibraryName && NativeLibraryPath != null)
++                libHandle = NativeLibrary.Load(NativeLibraryPath);
++            return libHandle;
++        }
++
++        /// <summary>
++        /// Async callback delegate
++        /// </summary>
++        public delegate void AsyncIOCallback(IntPtr context, int result, ulong bytesTransferred);
++        readonly IntPtr nativeDevice;
++
++        [DllImport(NativeLibraryName, EntryPoint = "RedyDevice_Create", CallingConvention = CallingConvention.Cdecl)]
++        static extern IntPtr RedyDevice_Create(string file, bool enablePrivileges, bool unbuffered, bool delete_on_close);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RedyDevice_Destroy", CallingConvention = CallingConvention.Cdecl)]
++        static extern void RedyDevice_Destroy(IntPtr device);
++
++        // [DllImport(NativeLibraryName, EntryPoint = "NativeDevice_sector_size", CallingConvention = CallingConvention.Cdecl)]
++        // static extern uint NativeDevice_sector_size(IntPtr device);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RedyDevice_ReadAsync", CallingConvention = CallingConvention.Cdecl)]
++        static extern int RedyDevice_ReadAsync(IntPtr device, ulong source, IntPtr dest, uint length, AsyncIOCallback callback, IntPtr context);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RedyDevice_WriteAsync", CallingConvention = CallingConvention.Cdecl)]
++        static extern int RedyDevice_WriteAsync(IntPtr device, IntPtr source, ulong dest, uint length, AsyncIOCallback callback, IntPtr context);
++
++        // [DllImport(NativeLibraryName, EntryPoint = "NativeDevice_CreateDir", CallingConvention = CallingConvention.Cdecl)]
++        // static extern void NativeDevice_CreateDir(IntPtr device, string dir);
++
++        // [DllImport(NativeLibraryName, EntryPoint = "NativeDevice_TryComplete", CallingConvention = CallingConvention.Cdecl)]
++        // static extern bool NativeDevice_TryComplete(IntPtr device);
++
++        // [DllImport(NativeLibraryName, EntryPoint = "NativeDevice_QueueRun", CallingConvention = CallingConvention.Cdecl)]
++        // static extern int NativeDevice_QueueRun(IntPtr device, int timeout_secs);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RedyDevice_GetFileSize", CallingConvention = CallingConvention.Cdecl)]
++        static extern ulong RedyDevice_GetFileSize(IntPtr device, ulong segment);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RedyDevice_Reset", CallingConvention = CallingConvention.Cdecl)]
++        static extern void RedyDevice_Reset(IntPtr device);
++
++        [DllImport(NativeLibraryName, EntryPoint = "RedyDevice_RemoveSegment", CallingConvention = CallingConvention.Cdecl)]
++        static extern void RedyDevice_RemoveSegment(IntPtr device, ulong segment);
++        #endregion
++
++        readonly AsyncIOCallback _callbackDelegate;
++        // readonly CancellationTokenSource completionThreadToken;
++        // readonly SemaphoreSlim completionThreadSemaphore;
++        // int numCompletionThreads;
++
++        void _callback(IntPtr context, int errorCode, ulong numBytes)
++        {
++            Interlocked.Decrement(ref numPending);
++            var result = results[(int)context];
++            result.callback((uint)errorCode, (uint)numBytes, result.context);
++            freeResults.Enqueue((int)context);
++        }
++
++        /// <inheritdoc />
++        public override bool Throttle() => numPending > ThrottleLimit;
++
++        /// <summary>
++        /// Constructor with more options for derived classes
++        /// </summary>
++        /// <param name="filename">File name (or prefix) with path</param>
++        /// <param name="deleteOnClose"></param>
++        /// <param name="disableFileBuffering"></param>
++        /// <param name="capacity">The maximum number of bytes this storage device can accommodate, or CAPACITY_UNSPECIFIED if there is no such limit </param>
++        /// <param name="numCompletionThreads">Number of IO completion threads</param>
++        /// <param name="logger"></param>
++        public RedyDevice(string filename,
++                                      bool deleteOnClose = false,
++                                      bool disableFileBuffering = true,
++                                      long capacity = Devices.CAPACITY_UNSPECIFIED, int numCompletionThreads = 1, ILogger logger = null)
++                : base(filename, GetSectorSize(filename), capacity)
++        {
++
++            // Native device uses a fixed segment size
++            nativeSegmentSizeBits = 25;
++
++            _callbackDelegate = _callback;
++
++            if (filename.Length > Native32.WIN32_MAX_PATH - 11)     // -11 to allow for ".<segment>"
++                throw new TsavoriteException($"Path {filename} is too long");
++
++            ThrottleLimit = 256;
++
++            string path = new FileInfo(filename).Directory.FullName;
++            if (!Directory.Exists(path))
++                Directory.CreateDirectory(path);
++            this.logger = logger;
++
++            nativeDevice = RedyDevice_Create(filename, false, disableFileBuffering, deleteOnClose);
++            results = new RedyResult[MaxResults];
++        }
++
++        /// <inheritdoc />
++        public override void Initialize(long segmentSize, LightEpoch epoch = null, bool omitSegmentIdFromFilename = false)
++        {
++            // We can simulate any segment size less than or equal to native segment size
++            if (segmentSize > (1L << nativeSegmentSizeBits))
++                throw new TsavoriteException("Redy storage device does not support segment sizes greater than 32M");
++            base.Initialize(segmentSize, epoch, omitSegmentIdFromFilename);
++        }
++
++        /// <inheritdoc />
++        public override void Reset()
++            => RedyDevice_Reset(nativeDevice);
++
++        /// <inheritdoc />
++        public override void ReadAsync(int segmentId, ulong sourceAddress,
++                                     IntPtr destinationAddress,
++                                     uint readLength,
++                                     DeviceIOCompletionCallback callback,
++                                     object context)
++        {
++            int offset;
++            // Console.WriteLine($"ReadAsync: segmentId={segmentId}, sourceAddress={sourceAddress}, destinationAddress={destinationAddress}, readLength={readLength}");
++            while (!freeResults.TryDequeue(out offset))
++            {
++                if (resultOffset < MaxResults)
++                {
++                    offset = Interlocked.Increment(ref resultOffset) - 1;
++                    if (offset < MaxResults) break;
++                }
++                Thread.Yield();
++            }
++            ref var result = ref results[offset];
++            result.context = context;
++            result.callback = callback;
++
++            try
++            {
++                if (Interlocked.Increment(ref numPending) <= 0)
++                    throw new Exception("Cannot operate on disposed device");
++                int _result = RedyDevice_ReadAsync(nativeDevice, ((ulong)segmentId << nativeSegmentSizeBits) | sourceAddress, destinationAddress, readLength, _callbackDelegate, (IntPtr)offset);
++
++                if (_result != 0)
++                {
++                    throw new IOException("Error reading from log file", _result);
++                }
++            }
++            catch (IOException e)
++            {
++                Interlocked.Decrement(ref numPending);
++                callback((uint)(e.HResult & 0x0000FFFF), 0, context);
++                freeResults.Enqueue(offset);
++            }
++            catch
++            {
++                Interlocked.Decrement(ref numPending);
++                callback(uint.MaxValue, 0, context);
++                freeResults.Enqueue(offset);
++            }
++        }
++
++        /// <inheritdoc />
++        public override unsafe void WriteAsync(IntPtr sourceAddress,
++                                      int segmentId,
++                                      ulong destinationAddress,
++                                      uint numBytesToWrite,
++                                      DeviceIOCompletionCallback callback,
++                                      object context)
++        {
++            int offset;
++            while (!freeResults.TryDequeue(out offset))
++            {
++                if (resultOffset < MaxResults)
++                {
++                    offset = Interlocked.Increment(ref resultOffset) - 1;
++                    if (offset < MaxResults) break;
++                }
++                Thread.Yield();
++            }
++            ref var result = ref results[offset];
++            result.context = context;
++            result.callback = callback;
++
++            try
++            {
++                if (Interlocked.Increment(ref numPending) <= 0)
++                    throw new Exception("Cannot operate on disposed device");
++                int _result = RedyDevice_WriteAsync(nativeDevice, sourceAddress, ((ulong)segmentId << nativeSegmentSizeBits) | destinationAddress, numBytesToWrite, _callbackDelegate, (IntPtr)offset);
++
++                if (_result != 0)
++                {
++                    throw new IOException("Error writing to log file", _result);
++                }
++            }
++            catch (IOException e)
++            {
++                Interlocked.Decrement(ref numPending);
++                callback((uint)(e.HResult & 0x0000FFFF), 0, context);
++            }
++            catch
++            {
++                Interlocked.Decrement(ref numPending);
++                callback(uint.MaxValue, 0, context);
++            }
++        }
++
++        /// <summary>
++        /// <see cref="IDevice.RemoveSegment(int)"/>
++        /// </summary>
++        /// <param name="segment"></param>
++        public override void RemoveSegment(int segment)
++            => RedyDevice_RemoveSegment(nativeDevice, (ulong)segment);
++
++        /// <summary>
++        /// <see cref="IDevice.RemoveSegmentAsync(int, AsyncCallback, IAsyncResult)"/>
++        /// </summary>
++        /// <param name="segment"></param>
++        /// <param name="callback"></param>
++        /// <param name="result"></param>
++        public override void RemoveSegmentAsync(int segment, AsyncCallback callback, IAsyncResult result)
++        {
++            RemoveSegment(segment);
++            callback(result);
++        }
++
++        /// <summary>
++        /// Close device
++        /// </summary>
++        public override void Dispose()
++        {
++            // Stop accepting new requests, drain all pending
++            if (nativeDevice != IntPtr.Zero)
++            {
++                // Wait for all operations to complete (just to be safe).
++                while (Interlocked.CompareExchange(ref numPending, 0, 0) != 0)
++                {
++                    Thread.Sleep(10);
++                }
++
++                RedyDevice_Destroy(nativeDevice);
++            }
++        }
++
++        // /// <inheritdoc/>
++        // public override bool TryComplete()
++        //     => NativeDevice_TryComplete(nativeDevice);
++
++        /// <inheritdoc/>
++        public override long GetFileSize(int segment)
++            => (long)RedyDevice_GetFileSize(nativeDevice, (ulong)segment);
++
++        /// <summary>
++        ///
++        /// </summary>
++        /// <param name="segmentId"></param>
++        /// <returns></returns>
++        protected string GetSegmentName(int segmentId) => GetSegmentFilename(FileName, segmentId);
++
++        private static uint GetSectorSize(string filename)
++        {
++            return sectorSize;
++        }
++
++        // void CompletionWorker()
++        // {
++        //     try
++        //     {
++        //         while (true)
++        //         {
++        //             if (completionThreadToken.IsCancellationRequested) break;
++        //             NativeDevice_QueueRun(nativeDevice, 5);
++        //             Thread.Yield();
++        //         }
++        //     }
++        //     finally
++        //     {
++        //         if (Interlocked.Decrement(ref numCompletionThreads) == 0)
++        //         {
++        //             completionThreadSemaphore.Release();
++        //         }
++        //     }
++        // }
++    }
++}
+\ No newline at end of file
+diff --git a/libs/storage/Tsavorite/cs/src/core/Index/Tsavorite/Implementation/InternalRead.cs b/libs/storage/Tsavorite/cs/src/core/Index/Tsavorite/Implementation/InternalRead.cs
+index e20c675b9..ec172ff76 100644
+--- a/libs/storage/Tsavorite/cs/src/core/Index/Tsavorite/Implementation/InternalRead.cs
++++ b/libs/storage/Tsavorite/cs/src/core/Index/Tsavorite/Implementation/InternalRead.cs
+@@ -3,6 +3,7 @@
+ 
+ using System.Diagnostics;
+ using System.Runtime.CompilerServices;
++using System;
+ 
+ namespace Tsavorite.core
+ {
+@@ -151,6 +152,12 @@ namespace Tsavorite.core
+ 
+                 if (stackCtx.recSrc.LogicalAddress >= hlogBase.BeginAddress)
+                 {
++
++                    if (typeof(TOutput) == typeof(SpanByteAndMemory) && Agent.CheckAndReturn(ref Unsafe.As<TKey, SpanByte>(ref key), ref Unsafe.As<TOutput, SpanByteAndMemory>(ref output)))
++                    {
++                        return OperationStatus.SUCCESS;
++                    }
++                    Console.WriteLine("Agent.CheckAndReturn failed");
+                     // On-Disk Region
+                     Debug.Assert(!sessionFunctions.IsManualLocking || LockTable.IsLocked(ref stackCtx.hei), "A Lockable-session Read() of an on-disk key requires a LockTable lock");
+ 
+diff --git a/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs b/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs
+index 9cacbed79..29edfbc07 100644
+--- a/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs
++++ b/libs/storage/Tsavorite/cs/src/core/TsavoriteLog/TsavoriteLog.cs
+@@ -258,6 +258,8 @@ namespace Tsavorite.core
+                 periodicRefreshSafeTailAddressBumpCallbackAction = PeriodicRefreshSafeTailAddressBumpCallback;
+                 safeTailRefreshTask = Task.Run(SafeTailRefreshWorker);
+             }
++            Console.WriteLine("Initializing agent");
++            Agent.Initialize("agent_id", "agent_key");
+         }
+ 
+         async Task SafeTailRefreshWorker()

@@ -1,0 +1,176 @@
+#include "leap.hpp"
+
+
+namespace dpf {
+namespace benchmark {
+
+
+static uint64_t round_to_power_of_two(uint64_t x) {
+  if (x == 0) return 1;
+  x--;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  x |= x >> 32;
+  x++;
+  return x;
+}
+
+void Leap::Initialize(const LeapConfig& config) {
+  config_ = config;
+  access_history_.clear();
+  lru_cache_.Initialize(config_.page_cache_size);
+}
+
+void Leap::ProcessAccess(uint64_t page_id) {
+  if (access_history_.empty()) {
+    access_history_.push_back(0);
+    last_page_id_ = page_id;
+    return;
+  }
+  int64_t delta = static_cast<int64_t>(page_id) - static_cast<int64_t>(last_page_id_);
+  last_page_id_ = page_id;
+  if (access_history_.size() == config_.access_history_size) {
+    access_history_.pop_front();
+  }
+  access_history_.push_back(delta);
+  if (access_history_.size() == config_.access_history_size) {
+    DoPrefetch(page_id);
+  }
+}
+
+bool Leap::IsPrefetchedCandidate(uint64_t page_id) {
+  auto out = lru_cache_.Get(page_id);
+  if (out) {
+    cache_hits_after_last_prefetch_++;
+    lru_cache_.Evict(page_id);
+  }
+  return out;
+}
+
+void Leap::PrefetchRequest(uint64_t page_id) {
+  // not implemented currently
+  throw std::runtime_error("Not implemented");
+}
+
+//
+// Private methods
+//
+
+int64_t Leap::FindTrend(size_t num_splits) {
+  if (num_splits == 0) return 0;
+  auto h_size = access_history_.size();
+  auto w = static_cast<uint64_t>(h_size / num_splits);  
+  w = std::max(w, 1UL);
+  int64_t maj_element = 0;
+  while (w <= h_size) {
+    auto end = access_history_.end();
+    auto start = end - w;
+    maj_element = BoyerMooreMajority(start, end);
+    w *= 2;
+    if (maj_element != 0) {
+      return maj_element;
+    }
+  }
+  return 0;
+}
+
+int64_t Leap::BoyerMooreMajority(const std::deque<int64_t>::iterator& start, const std::deque<int64_t>::iterator& end) {
+  if (start == end) {
+    return 0;
+  }
+
+  int64_t candidate = *start;
+  int count = 1;
+
+  // Find potential majority element
+  for (auto it = start + 1; it != end; ++it) {
+    if (count == 0) {
+      candidate = *it;
+      count = 1;
+    } else if (candidate == *it) {
+      count++;
+    } else {
+      count--;
+    }
+  }
+  
+  // Verify if the candidate is actually a majority
+  count = 0;
+  for (auto it = start; it != end; ++it) {
+    if (*it == candidate) {
+      count++;
+    }
+  }
+    
+  if (count > (end - start) / 2) {
+    return candidate;
+  }
+  return 0; // No majority element found
+}
+
+uint64_t Leap::GetPrefetchWindowSize(uint64_t page_id) {
+  auto pw_curr = pw_curr_;
+  auto pw_prev = pw_prev_;
+  auto c_hit = cache_hits_after_last_prefetch_;
+
+  if (c_hit == 0) {
+    // check if the page has been already added to the access history
+    auto curr_page_delta = access_history_.back();
+    auto prev_page_delta = *(access_history_.rbegin() + 1);
+    if (curr_page_delta == prev_page_delta) { // if page follows the current trend
+      pw_curr = 1;
+    } else {
+      pw_curr = 0; // suspend prefetching
+    }
+  } else {
+    pw_curr = round_to_power_of_two(c_hit + 1);
+  }
+  pw_curr = std::min(pw_curr, config_.max_prefetch_window_size);
+  if (pw_curr < (pw_prev / 2)) {
+    pw_curr = pw_prev / 2;
+  }
+  cache_hits_after_last_prefetch_ = 0;
+  pw_prev_ = pw_curr;
+  return pw_curr;
+}
+
+void Leap::DoPrefetch(uint64_t page_id) {
+  auto pw = GetPrefetchWindowSize(page_id);
+  if (pw != 0) {
+    // find the trend
+    auto maj = FindTrend(config_.num_splits);
+    if (maj != 0) {
+      latest_trend_ = maj;
+      for (int64_t i = 1; i <= static_cast<int64_t>(pw); i++) {
+        auto base = static_cast<int64_t>(page_id);
+        auto cand = base + latest_trend_ * i;
+        if (cand < 0) {
+          continue;
+        }
+        auto page_to_prefetch = static_cast<uint64_t>(cand);
+        lru_cache_.Put(page_to_prefetch);
+      }
+    } else {
+      // read pw_size pages around p with the latest trend
+      int64_t start = (-1 * static_cast<int64_t>(pw)) / 2;
+      int64_t end = start + pw;
+      for (auto i = start; i < end; i++) {
+        auto base = static_cast<int64_t>(page_id);
+        auto cand = base + latest_trend_ * i;
+        if (cand < 0) {
+          continue;
+        }
+        auto page_to_prefetch = static_cast<uint64_t>(cand);
+        lru_cache_.Put(page_to_prefetch);
+      }
+    }
+  } else {
+    // no prefetching
+  }
+}
+
+} // namespace benchmark
+} // namespace dpf

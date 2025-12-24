@@ -1,0 +1,12 @@
+{
+  "doca_dpdk_flags": {
+    "devices": [
+      {
+        "device": "sf",
+        "id": "2",
+        "sft": false
+      }
+    ],
+    "core-list": "7"
+  }
+}

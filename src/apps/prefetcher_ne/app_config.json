@@ -1,0 +1,28 @@
+{
+  "ne_only": false,
+  "offload_server": {
+    "server_addr": "10.10.1.100",
+    "server_port": "51216",
+    "max_wr": 2048,
+    "use_rdma": true,
+    "dpu_pcie_addr": "03:00.0",
+    "export_desc_client_file_path": "/home/ubuntu/export_desc_client",
+    "buf_client_file_path": "/home/ubuntu/buf_client.txt",
+    "export_desc_agent_file_path": "/home/ubuntu/agent_export_desc",
+    "buf_agent_file_path": "/home/ubuntu/agent_buf_details.txt",
+    "enable_transfer": false,
+    "enable_agent": true,
+    "num_slots": 8,
+    "num_prefetch_slots": 8,
+    "slot_size": 16384
+  },
+  "network_engine": {
+    "sf_port": "en3f0pf0sf0",
+    "pf_port": "p0",
+    "ovs_bridge": "ovsbr1",
+    "dst_ip_addr": "10.10.1.101",
+    "src_ip_addr": "10.10.1.100",
+    "dst_port": 1234
+  },
+  "prefetcher": {}
+}

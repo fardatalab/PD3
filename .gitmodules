@@ -1,0 +1,6 @@
+[submodule "external/json"]
+	path = external/json
+	url = git@github.com:nlohmann/json.git
+[submodule "external/SPSCQueue"]
+	path = external/SPSCQueue
+	url = git@github.com:rigtorp/SPSCQueue.git

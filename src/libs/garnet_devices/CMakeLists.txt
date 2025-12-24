@@ -1,0 +1,4 @@
+add_subdirectory(rdma_sync_device)
+add_subdirectory(redy_device)
+add_subdirectory(leap_device)
+add_subdirectory(rdma_device)
