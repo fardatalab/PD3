@@ -10,7 +10,7 @@ import os
 
 def read_latency_files(workloads, thread_counts, directory="."):
     """
-    Read throughput files of the form: res.<workload>.<num_threads>.tput
+    Read throughput files of the form: res.<workload>.<num_threads>.lat
     
     Args:
         workloads: List of workload names (e.g., ['RDMA', 'Leap', 'Redy', 'PD3'])

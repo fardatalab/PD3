@@ -11,7 +11,7 @@ On the compute node:
 - Run the hashmap application: `~/hashmap/sync_rdma/run.sh`
 
 On the client node:
-- Run the client process: `~/hashmap/fig11.sh SYNC_RDMA ~/fig11`. This will generate result files under the supplied directory
+- Run the client process: `~/exp/fig11.sh SYNC_RDMA ~/exp/fig11`. This will generate result files under the supplied directory
 
 ### Redy
 
