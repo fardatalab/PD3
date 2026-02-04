@@ -13,10 +13,12 @@ It is advised to run the experiments in the following order (note that some figu
 - Fig 12
 - Fig 15
 - Fig 16
-- Fig 13
-- Fig 17
 - Fig 14
 - Fig 18
+- Fig 21a
+- Fig 21c
+- Fig 13
+- Fig 17
+- Fig 21b
 - Fig 19
-- Fig 21
 - Fig 22
