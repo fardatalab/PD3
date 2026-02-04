@@ -1,3 +1,4 @@
+#! /usr/bin/python3
 # Hashmap Throughput (Uniform) : Fig 11
 import matplotlib.pyplot as plt
 
@@ -44,11 +45,13 @@ def read_throughput_files(workloads, thread_counts, directory="."):
 # ——— Data ———
 thread_counts = [1, 2, 4, 8]
 workloads = ['RDMA', 'Leap', 'Redy', 'PD3']
+# workloads = ['RDMA', 'Leap', 'Redy']
 
 configs = np.array([str(t) for t in thread_counts])
 
 # Read throughput values from files
 values_op1, values_op2, values_op3, values_op4 = read_throughput_files(workloads, thread_counts)
+# values_op1, values_op2, values_op3 = read_throughput_files(workloads, thread_counts)
 
 uni_fontsize = 10
 
@@ -85,7 +88,7 @@ ax.set_xlabel('#Threads', fontsize=uni_fontsize)
 ax.set_xticks(x)
 ax.set_xticklabels(configs)
 
-ax.set_ylim(0, 70)
+ax.set_ylim(0, 1.2)
 
 ax.legend(
     frameon=False,
@@ -109,4 +112,4 @@ fig.tight_layout()
 
 # Save figure to the same directory as this script
 script_dir = os.path.dirname(os.path.abspath(__file__))
-fig.savefig(os.path.join(script_dir, 'fig.pdf'))
+fig.savefig(os.path.join(script_dir, 'fig.png'))
